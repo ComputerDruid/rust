@@ -53,7 +53,18 @@ fn trait_of_item(tcx: TyCtxt<'_>, def_id: DefId) -> Option<DefId> {
 fn associated_item(tcx: TyCtxt<'_>, def_id: DefId) -> ty::AssocItem {
     let id = tcx.hir().local_def_id_to_hir_id(def_id.expect_local());
     let parent_def_id = tcx.hir().get_parent_item(id);
-    let parent_item = tcx.hir().expect_item(parent_def_id);
+    let parent_item = match tcx.hir().expect_owner(parent_def_id) {
+        hir::OwnerNode::Item(item) => item,
+        hir::OwnerNode::TraitItem(item) => {
+            let item_id = tcx.hir().local_def_id_to_hir_id(item.def_id);
+            let trait_def_id = tcx.hir().get_parent_item(item_id);
+            tcx.hir().expect_item(trait_def_id)
+        }
+        _ => bug!(
+            "expected item or trait item, found {}",
+            tcx.hir().node_to_string(hir::HirId::make_owner(parent_def_id))
+        ),
+    };
     match parent_item.kind {
         hir::ItemKind::Impl(ref impl_) => {
             if let Some(impl_item_ref) =
