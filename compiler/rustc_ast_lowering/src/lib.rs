@@ -1227,7 +1227,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                         generic_params,
                         unsafety: this.lower_unsafety(f.unsafety),
                         abi: this.lower_extern(f.ext),
-                        decl: this.lower_fn_decl(&f.decl, None, FnDeclKind::Pointer, None),
+                        decl: this.lower_fn_decl(&f.decl, None, FnDeclKind::Pointer, None, None),
                         param_names: this.lower_fn_params_to_names(&f.decl),
                     }))
                 })
@@ -1483,6 +1483,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         fn_node_id: Option<NodeId>,
         kind: FnDeclKind,
         make_ret_async: Option<NodeId>,
+        trait_id: Option<LocalDefId>,
     ) -> &'hir hir::FnDecl<'hir> {
         let c_variadic = decl.c_variadic();
 
@@ -1514,11 +1515,19 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         }));
 
         let output = if let Some(ret_id) = make_ret_async {
-            self.lower_async_fn_ret_ty(
-                &decl.output,
-                fn_node_id.expect("`make_ret_async` but no `fn_def_id`"),
-                ret_id,
-            )
+            match kind {
+                FnDeclKind::Trait => self.lower_async_trait_fn_ret_ty(
+                    &decl.output,
+                    fn_node_id.expect("`make_ret_async` but no `fn_def_id`"),
+                    ret_id,
+                    trait_id.unwrap(),
+                ),
+                _ => self.lower_async_fn_ret_ty(
+                    &decl.output,
+                    fn_node_id.expect("`make_ret_async` but no `fn_def_id`"),
+                    ret_id,
+                ),
+            }
         } else {
             match decl.output {
                 FnRetTy::Ty(ref ty) => {
@@ -1676,6 +1685,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         debug!(?captures);
 
         self.with_hir_id_owner(opaque_ty_node_id, |this| {
+            // we will need this for the associated type
             let future_bound =
                 this.while_capturing_lifetimes(opaque_ty_def_id, &mut captures, |this| {
                     // We have to be careful to get elision right here. The
@@ -1760,6 +1770,124 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
             hir::TyKind::OpaqueDef(hir::ItemId { def_id: opaque_ty_def_id }, generic_args);
         let opaque_ty = self.ty(opaque_ty_span, opaque_ty_ref);
         hir::FnRetTy::Return(self.arena.alloc(opaque_ty))
+    }
+
+    // FIXME: doc this, starting with doc comment from lower_async_fn_ret_ty
+    #[tracing::instrument(level = "debug", skip(self))]
+    fn lower_async_trait_fn_ret_ty(
+        &mut self,
+        output: &FnRetTy,
+        fn_node_id: NodeId,
+        opaque_ty_node_id: NodeId,
+        trait_id: LocalDefId,
+    ) -> hir::FnRetTy<'hir> {
+        let span = output.span();
+
+        // let opaque_ty_def_id = self.local_def_id(opaque_ty_node_id);
+        let opaque_ty_span = self.mark_span_with_reason(DesugaringKind::Async, span, None);
+
+        // HIR should look something like this
+        // output: Return(
+        //     Ty {
+        //         hir_id: HirId {
+        //             owner: DefId(0:21 ~ async_trait_fn[ac97]::TExample::example),
+        //             local_id: 1,
+        //         },
+        //         kind: Path(
+        //             TypeRelative(
+        //                 Ty {
+        //                     hir_id: HirId {
+        //                         owner: DefId(0:21 ~ async_trait_fn[ac97]::TExample::example),
+        //                         local_id: 3,
+        //                     },
+        //                     kind: Path(
+        //                         Resolved(
+        //                             None,
+        //                             Path {
+        //                                 span: src/test/ui/async-await/async-trait-fn.rs:15:21: 15:25 (#0),
+        //                                 res: SelfTy {
+        //                                     trait_: Some(
+        //                                         DefId(0:19 ~ async_trait_fn[ac97]::TExample),
+        //                                     ),
+        //                                     alias_to: None,
+        //                                 },
+        //                                 segments: [
+        //                                     PathSegment {
+        //                                         ident: Self#0,
+        //                                         hir_id: Some(
+        //                                             HirId {
+        //                                                 owner: DefId(0:21 ~ async_trait_fn[ac97]::TExample::example),
+        //                                                 local_id: 2,
+        //                                             },
+        //                                         ),
+        //                                         res: Some(
+        //                                             SelfTy {
+        //                                                 trait_: Some(
+        //                                                     DefId(0:19 ~ async_trait_fn[ac97]::TExample),
+        //                                                 ),
+        //                                                 alias_to: None,
+        //                                             },
+        //                                         ),
+        //                                         args: None,
+        //                                         infer_args: false,
+        //                                     },
+        //                                 ],
+        //                             },
+        //                         ),
+        //                     ),
+        //                     span: src/test/ui/async-await/async-trait-fn.rs:15:21: 15:25 (#0),
+        //                 },
+        //                 PathSegment {
+        //                     ident: Output#0,
+        //                     hir_id: Some(
+        //                         HirId {
+        //                             owner: DefId(0:21 ~ async_trait_fn[ac97]::TExample::example),
+        //                             local_id: 4,
+        //                         },
+        //                     ),
+        //                     res: Some(
+        //                         Err,
+        //                     ),
+        //                     args: None,
+        //                     infer_args: false,
+        //                 },
+        //             ),
+        //         ),
+        //         span: src/test/ui/async-await/async-trait-fn.rs:15:21: 15:33 (#0),
+        //     },
+        // ),
+        // c_variadic: false,
+        // implicit_self: None,
+
+        let ret_ty_ref = {
+            let trait_res =
+                hir::def::Res::SelfTy { trait_: Some(trait_id.to_def_id()), alias_to: None };
+            let self_ident = Ident::with_dummy_span(kw::SelfUpper);
+            hir::TyKind::Path(hir::QPath::TypeRelative(
+                self.arena.alloc(self.ty(
+                    self_ident.span,
+                    hir::TyKind::Path(hir::QPath::Resolved(
+                        None,
+                        self.arena.alloc(hir::Path {
+                            res: trait_res,
+                            segments: arena_vec![self; hir::PathSegment{
+                                    ident: self_ident,
+                                    hir_id: None,
+                                    res: Some(trait_res),
+                                    args: None,
+                                    infer_args: false,
+                            }],
+                            span: opaque_ty_span,
+                        }),
+                    )),
+                )),
+                self.arena
+                    .alloc(hir::PathSegment::from_ident(Ident::from_str("FakeAsyncAssocItem"))),
+            ))
+        };
+
+        let ret_ty = self.ty(opaque_ty_span, ret_ty_ref);
+        hir::FnRetTy::Return(self.arena.alloc(ret_ty))
     }
 
     /// Transforms `-> T` into `Future<Output = T>`.

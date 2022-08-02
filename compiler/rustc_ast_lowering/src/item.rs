@@ -147,10 +147,24 @@ impl<'a, 'hir> ItemLowerer<'a, 'hir> {
             };
 
             match ctxt {
-                AssocCtxt::Trait => hir::OwnerNode::TraitItem(lctx.lower_trait_item(item)),
+                AssocCtxt::Trait => {
+                    hir::OwnerNode::TraitItem(lctx.lower_trait_item(item, parent_id))
+                }
                 AssocCtxt::Impl => hir::OwnerNode::ImplItem(lctx.lower_impl_item(item)),
             }
-        })
+        });
+        if let AssocItemKind::Fn(box fun) = &item.kind {
+            if let Some(return_id) = fun.sig.header.asyncness.opt_return_id() {
+                if let AssocCtxt::Trait = ctxt {
+                    let generics = self.owners[def_id].unwrap().node().expect_trait_item().generics;
+                    self.with_lctx(return_id, |lctx| {
+                        hir::OwnerNode::TraitItem(
+                            lctx.lower_async_trait_fn_assoc_type(fun, generics),
+                        )
+                    });
+                }
+            }
+        }
     }
 
     fn lower_foreign_item(&mut self, item: &ForeignItem) {
@@ -263,7 +277,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                     let itctx = ImplTraitContext::Universal;
                     let (generics, decl) = this.lower_generics(generics, id, itctx, |this| {
                         let ret_id = asyncness.opt_return_id();
-                        this.lower_fn_decl(&decl, Some(id), FnDeclKind::Fn, ret_id)
+                        this.lower_fn_decl(&decl, Some(id), FnDeclKind::Fn, ret_id, None)
                     });
                     let sig = hir::FnSig {
                         decl,
@@ -436,7 +450,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                             ImplTraitContext::Disallowed(ImplTraitPosition::Bound),
                         );
                         let items = this.arena.alloc_from_iter(
-                            items.iter().map(|item| this.lower_trait_item_ref(item)),
+                            items.iter().flat_map(|item| this.lower_trait_item_ref(item)),
                         );
                         let unsafety = this.lower_unsafety(unsafety);
                         (unsafety, items, bounds)
@@ -653,7 +667,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                         self.lower_generics(generics, i.id, itctx, |this| {
                             (
                                 // Disallow `impl Trait` in foreign items.
-                                this.lower_fn_decl(fdec, None, FnDeclKind::ExternFn, None),
+                                this.lower_fn_decl(fdec, None, FnDeclKind::ExternFn, None, None),
                                 this.lower_fn_params_to_names(fdec),
                             )
                         });
@@ -751,7 +765,11 @@ impl<'hir> LoweringContext<'_, 'hir> {
         }
     }
 
-    fn lower_trait_item(&mut self, i: &AssocItem) -> &'hir hir::TraitItem<'hir> {
+    fn lower_trait_item(
+        &mut self,
+        i: &AssocItem,
+        trait_id: LocalDefId,
+    ) -> &'hir hir::TraitItem<'hir> {
         let hir_id = self.lower_node_id(i.id);
         let trait_item_def_id = hir_id.expect_owner();
 
@@ -762,9 +780,17 @@ impl<'hir> LoweringContext<'_, 'hir> {
                 (hir::Generics::empty(), hir::TraitItemKind::Const(ty, body))
             }
             AssocItemKind::Fn(box Fn { ref sig, ref generics, body: None, .. }) => {
+                let asyncness = sig.header.asyncness;
+
                 let names = self.lower_fn_params_to_names(&sig.decl);
-                let (generics, sig) =
-                    self.lower_method_sig(generics, sig, i.id, FnDeclKind::Trait, None);
+                let (generics, sig) = self.lower_method_sig(
+                    generics,
+                    sig,
+                    i.id,
+                    FnDeclKind::Trait,
+                    asyncness.opt_return_id(),
+                    Some(trait_id),
+                );
                 (generics, hir::TraitItemKind::Fn(sig, hir::TraitFn::Required(names)))
             }
             AssocItemKind::Fn(box Fn { ref sig, ref generics, body: Some(ref body), .. }) => {
@@ -777,6 +803,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                     i.id,
                     FnDeclKind::Trait,
                     asyncness.opt_return_id(),
+                    None,
                 );
                 (generics, hir::TraitItemKind::Fn(sig, hir::TraitFn::Provided(body_id)))
             }
@@ -821,26 +848,73 @@ impl<'hir> LoweringContext<'_, 'hir> {
         self.arena.alloc(item)
     }
 
-    fn lower_trait_item_ref(&mut self, i: &AssocItem) -> hir::TraitItemRef {
+    fn lower_async_trait_fn_assoc_type(
+        &mut self,
+        fun: &Fn,
+        generics: &'hir hir::Generics<'hir>,
+    ) -> &'hir hir::TraitItem<'hir> {
+        let sig = &fun.sig;
+        let asyncness = fun.sig.header.asyncness;
+        let opaque_ty_node_id = asyncness.opt_return_id().unwrap();
+        let span = sig.decl.output.span();
+        let opaque_ty_span = self.mark_span_with_reason(DesugaringKind::Async, span, None);
+
+        let ret_def_id = self.local_def_id(opaque_ty_node_id);
+
+        info!("lowering async trait fn with opaque_ty_node_id {opaque_ty_node_id}");
+
+        let kind = hir::TraitItemKind::Type(
+            self.lower_param_bounds(&[], ImplTraitContext::Disallowed(ImplTraitPosition::Generic)),
+            None,
+        );
+
+        let item = hir::TraitItem {
+            def_id: ret_def_id,
+            ident: Ident::from_str("FakeAsyncAssocItem"),
+            generics,
+            kind,
+            span: opaque_ty_span,
+        };
+        self.arena.alloc(item)
+    }
+
+    fn lower_trait_item_ref(&mut self, i: &AssocItem) -> Vec<hir::TraitItemRef> {
+        let mut result = vec![];
         let (kind, has_default) = match &i.kind {
             AssocItemKind::Const(_, _, default) => (hir::AssocItemKind::Const, default.is_some()),
             AssocItemKind::TyAlias(box TyAlias { ty, .. }) => {
                 (hir::AssocItemKind::Type, ty.is_some())
             }
             AssocItemKind::Fn(box Fn { sig, body, .. }) => {
+                if let Some(return_id) = sig.header.asyncness.opt_return_id() {
+                    let id = hir::TraitItemId { def_id: self.local_def_id(return_id) };
+                    let span = self.mark_span_with_reason(
+                        DesugaringKind::Async,
+                        sig.decl.output.span(),
+                        None,
+                    );
+                    result.push(hir::TraitItemRef {
+                        id,
+                        ident: Ident::from_str("FakeAsyncAssocItem"),
+                        kind: hir::AssocItemKind::Type,
+                        span,
+                        defaultness: hir::Defaultness::Default { has_value: false },
+                    })
+                }
                 (hir::AssocItemKind::Fn { has_self: sig.decl.has_self() }, body.is_some())
             }
             AssocItemKind::MacCall(..) => unimplemented!(),
         };
         let id = hir::TraitItemId { def_id: self.local_def_id(i.id) };
         let defaultness = hir::Defaultness::Default { has_value: has_default };
-        hir::TraitItemRef {
+        result.push(hir::TraitItemRef {
             id,
             ident: self.lower_ident(i.ident),
             span: self.lower_span(i.span),
             defaultness,
             kind,
-        }
+        });
+        result
     }
 
     /// Construct `ExprKind::Err` for the given `span`.
@@ -868,6 +942,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                     i.id,
                     if self.is_in_trait_impl { FnDeclKind::Impl } else { FnDeclKind::Inherent },
                     asyncness.opt_return_id(),
+                    None,
                 );
 
                 (generics, hir::ImplItemKind::Fn(sig, body_id))
@@ -1228,11 +1303,12 @@ impl<'hir> LoweringContext<'_, 'hir> {
         id: NodeId,
         kind: FnDeclKind,
         is_async: Option<NodeId>,
+        trait_id: Option<LocalDefId>,
     ) -> (&'hir hir::Generics<'hir>, hir::FnSig<'hir>) {
         let header = self.lower_fn_header(sig.header);
         let itctx = ImplTraitContext::Universal;
         let (generics, decl) = self.lower_generics(generics, id, itctx, |this| {
-            this.lower_fn_decl(&sig.decl, Some(id), kind, is_async)
+            this.lower_fn_decl(&sig.decl, Some(id), kind, is_async, trait_id)
         });
         (generics, hir::FnSig { header, decl, span: self.lower_span(sig.span) })
     }
