@@ -1429,6 +1429,16 @@ impl<'a, 'b> Visitor<'b> for BuildReducedGraphVisitor<'a, 'b> {
                 if let Some(async_node_id) = sig.header.asyncness.opt_return_id() {
                     let local_def_id = self.r.local_def_id(async_node_id);
                     self.r.visibilities.insert(local_def_id, vis);
+
+                    //maybe remove later?
+                    let span = sig.decl.output.span();
+                    let res = Res::Def(DefKind::AssocTy, local_def_id.to_def_id());
+                    self.r.define(
+                        parent,
+                        Ident::from_str("FakeAsyncAssocItem"),
+                        TypeNS,
+                        (res, vis, span, expansion),
+                    );
                 }
             }
         }
