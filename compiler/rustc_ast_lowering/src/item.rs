@@ -9,8 +9,9 @@ use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::sorted_map::SortedMap;
 use rustc_errors::struct_span_err;
 use rustc_hir as hir;
-use rustc_hir::def::{DefKind, Res};
+use rustc_hir::def::{DefKind, LifetimeRes, Res};
 use rustc_hir::def_id::{LocalDefId, CRATE_DEF_ID};
+use rustc_hir::definitions::DefPathData;
 use rustc_hir::PredicateOrigin;
 use rustc_index::vec::{Idx, IndexVec};
 use rustc_middle::ty::{DefIdTree, ResolverAstLowering, TyCtxt};
@@ -159,7 +160,7 @@ impl<'a, 'hir> ItemLowerer<'a, 'hir> {
                     let generics = self.owners[def_id].unwrap().node().expect_trait_item().generics;
                     self.with_lctx(return_id, |lctx| {
                         hir::OwnerNode::TraitItem(
-                            lctx.lower_async_trait_fn_assoc_type(fun, generics),
+                            lctx.lower_async_trait_fn_assoc_type(item.id, fun, generics),
                         )
                     });
                 }
@@ -850,9 +851,11 @@ impl<'hir> LoweringContext<'_, 'hir> {
 
     fn lower_async_trait_fn_assoc_type(
         &mut self,
+        fn_node_id: NodeId,
         fun: &Fn,
         generics: &'hir hir::Generics<'hir>,
     ) -> &'hir hir::TraitItem<'hir> {
+        let fn_def_id = self.local_def_id(fn_node_id);
         let sig = &fun.sig;
         let asyncness = fun.sig.header.asyncness;
         let opaque_ty_node_id = asyncness.opt_return_id().unwrap();
@@ -863,10 +866,62 @@ impl<'hir> LoweringContext<'_, 'hir> {
 
         info!("lowering async trait fn with opaque_ty_node_id {opaque_ty_node_id}");
 
-        let kind = hir::TraitItemKind::Type(
-            self.lower_param_bounds(&[], ImplTraitContext::Disallowed(ImplTraitPosition::Generic)),
-            None,
-        );
+        let future_bound = {
+            // Lifetime capturing logic copied from lower_async_fn_ret_ty
+            let mut captures = FxHashMap::default();
+
+            let extra_lifetime_params = self.resolver.take_extra_lifetime_params(opaque_ty_node_id);
+            debug!(?extra_lifetime_params);
+            for (ident, outer_node_id, outer_res) in extra_lifetime_params {
+                let Ident { name, span } = ident;
+                let outer_def_id = self.local_def_id(outer_node_id);
+                let inner_node_id = self.next_node_id();
+
+                // Add a definition for the in scope lifetime def.
+                self.create_def(ret_def_id, inner_node_id, DefPathData::LifetimeNs(name));
+
+                let (p_name, inner_res) = match outer_res {
+                    // Input lifetime like `'a`:
+                    LifetimeRes::Param { param, .. } => (
+                        hir::ParamName::Plain(ident),
+                        LifetimeRes::Param { param, binder: fn_node_id },
+                    ),
+                    // Input lifetime like `'1`:
+                    LifetimeRes::Fresh { param, .. } => {
+                        (hir::ParamName::Fresh, LifetimeRes::Fresh { param, binder: fn_node_id })
+                    }
+                    LifetimeRes::Static | LifetimeRes::Error => continue,
+                    res => {
+                        panic!(
+                            "Unexpected lifetime resolution {:?} for {:?} at {:?}",
+                            res, ident, span
+                        )
+                    }
+                };
+
+                captures.insert(outer_def_id, (span, inner_node_id, p_name, inner_res));
+            }
+
+            debug!(?captures);
+            self.while_capturing_lifetimes(ret_def_id, &mut captures, |this| {
+                // We have to be careful to get elision right here. The
+                // idea is that we create a lifetime parameter for each
+                // lifetime in the return type.  So, given a return type
+                // like `async fn foo(..) -> &[&u32]`, we lower to `impl
+                // Future<Output = &'1 [ &'2 u32 ]>`.
+                //
+                // Then, we will create `fn foo(..) -> Foo<'_, '_>`, and
+                // hence the elision takes place at the fn site.
+                this.lower_async_fn_output_type_to_future_bound(
+                    &fun.sig.decl.output,
+                    fn_def_id,
+                    span,
+                )
+            })
+        };
+        debug!("lower_async_trait_fn_assoc_type: future_bound={:#?}", future_bound);
+
+        let kind = hir::TraitItemKind::Type(arena_vec![self; future_bound], None);
 
         let item = hir::TraitItem {
             def_id: ret_def_id,

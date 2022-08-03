@@ -32,9 +32,9 @@ fn free() -> F {
 struct Baz;
 
 impl T for Baz {
-    type FakeAsyncAssocItem = i32;
-    fn foo() -> i32 {
-        1
+    type FakeAsyncAssocItem = F;
+    fn foo() -> F {
+        F
     }
 }
 
