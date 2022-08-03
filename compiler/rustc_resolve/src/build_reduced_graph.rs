@@ -79,7 +79,7 @@ impl<'a> ToNameBinding<'a> for (Res, ty::Visibility, Span, LocalExpnId, IsMacroE
 }
 
 impl<'a> Resolver<'a> {
-    /// Defines `name` in namespace `ns` of module `parent` to be `def` if it is not yet defined;
+    /// Defines `ident` in namespace `ns` of module `parent` to be `def` if it is not yet defined;
     /// otherwise, reports an error.
     pub(crate) fn define<T>(&mut self, parent: Module<'a>, ident: Ident, ns: Namespace, def: T)
     where
