@@ -1424,6 +1424,13 @@ impl<'a, 'b> Visitor<'b> for BuildReducedGraphVisitor<'a, 'b> {
             let expansion = self.parent_scope.expansion;
             let res = Res::Def(def_kind, def_id);
             self.r.define(parent, item.ident, ns, (res, vis, item.span, expansion));
+
+            if let AssocItemKind::Fn(box Fn { ref sig, .. }) = item.kind {
+                if let Some(async_node_id) = sig.header.asyncness.opt_return_id() {
+                    let local_def_id = self.r.local_def_id(async_node_id);
+                    self.r.visibilities.insert(local_def_id, vis);
+                }
+            }
         }
 
         visit::walk_assoc_item(self, item, ctxt);
