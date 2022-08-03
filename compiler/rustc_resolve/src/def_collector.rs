@@ -5,6 +5,7 @@ use rustc_ast::*;
 use rustc_expand::expand::AstFragment;
 use rustc_hir::def_id::LocalDefId;
 use rustc_hir::definitions::*;
+use rustc_index::vec::Idx;
 use rustc_span::hygiene::LocalExpnId;
 use rustc_span::symbol::sym;
 use rustc_span::Span;
@@ -132,12 +133,25 @@ impl<'a, 'b> visit::Visitor<'a> for DefCollector<'a, 'b> {
     }
 
     fn visit_fn(&mut self, fn_kind: FnKind<'a>, span: Span, _: NodeId) {
-        if let FnKind::Fn(_, _, sig, _, generics, body) = fn_kind {
+        if let FnKind::Fn(ctxt, _, sig, _, generics, body) = fn_kind {
             if let Async::Yes { closure_id, return_impl_trait_id, .. } = sig.header.asyncness {
                 self.visit_generics(generics);
 
-                let return_impl_trait_id =
-                    self.create_def(return_impl_trait_id, DefPathData::ImplTrait, span);
+                let parent_key = self
+                    .resolver
+                    .definitions
+                    .def_path_table()
+                    .def_key(self.parent_def.local_def_index);
+                let return_impl_trait_id = match ctxt {
+                    visit::FnCtxt::Assoc(visit::AssocCtxt::Trait) => self.resolver.create_def(
+                        LocalDefId::new(parent_key.parent.unwrap().index()),
+                        return_impl_trait_id,
+                        DefPathData::ImplTrait,
+                        self.expansion.to_expn_id(),
+                        span.with_parent(None),
+                    ),
+                    _ => self.create_def(return_impl_trait_id, DefPathData::ImplTrait, span),
+                };
 
                 // For async functions, we need to create their inner defs inside of a
                 // closure to match their desugared representation. Besides that,
